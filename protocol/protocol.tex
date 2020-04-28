@@ -1,0 +1,696 @@
+% !TeX spellcheck = en_GB
+\documentclass [10pt]{scrartcl}
+
+
+\usepackage{latexsym}
+\usepackage{amssymb}
+\usepackage{epsfig} 
+\usepackage{fullpage,rotating}
+\usepackage{enumerate}
+\usepackage{xspace}
+\usepackage{amsmath}
+%\usepackage{newcommand}
+\usepackage{amssymb}
+\usepackage{dsfont}
+%\usepackage{dvsw}
+\usepackage{listings}
+\usepackage{tikz}
+\usepackage[edges]{forest} % for directory picture
+\usepackage{ textcomp }
+\usepackage{url}
+\usepackage{subcaption}
+\usepackage{hyperref}
+
+\usepackage[parfill]{parskip}
+\nonzeroparskip{}             % Create space between paragraphs
+\setlength{\parindent}{0pt} % Remove paragraph identation (optional).
+
+
+\lstset{language=C++,
+   % format=C, % if you enable this, check that the formating is still okay!
+   frame=single,
+   numbers=left,
+   captionpos=b,
+   breaklines=true,
+   breakautoindent=false,
+   postbreak=\raisebox{0ex}[0ex][0ex]{\ensuremath{\hookrightarrow\space}},
+   basicstyle=\scriptsize,
+   caption=\lstname,
+   captionpos=t,
+}
+
+
+\graphicspath{{graphics/}}
+
+
+\pagestyle{plain}
+\bibliographystyle{plain}
+
+
+\title{Advanced Multiprocessor Programming VU\\ 
+   184.726 2018S \\
+   Project 10 }
+\author{Sabrina Kall \\Lukas Punzenberger}
+
+\date{\today}
+
+
+
+
+
+\begin{document}
+   \newcommand{\picWidth}{.7\textwidth}
+   \maketitle
+   \pagebreak
+   \tableofcontents
+   \newpage
+   
+   \section{Problem}
+   As computing becomes more efficient and powerful, multiprocessor environments also grow more and more common, leaving us with the question: how to properly balance our workload to take advantage of all this power without completely taking over the entire memory?
+   
+   Locking down complete structures limits the degree of concurrency, while fixed memory fields are prone to overflows unless they are made big enough (risking memory waste and hindering other programs). In the project based on the paper~\cite{DCWS} by Yossi Lev and David Chase, we implement a wait-free and lock-free deque that uses atomic variables to get around the locking problem and also allows its memory to theoretically grow and shrink unhindered, preventing overflows and excessive memory use.
+   
+   
+   \section{Description of the Data Structure}
+   
+   Our data structure is the dynamic circular work-stealing deque (from here on known as DCWSDeque) from~\cite{DCWS}. It consists of a work-stealing double-ended queue storing its elements in a dynamic circular array which draws its memory from a shared memory pool. These components are described more in detail below.
+   
+   \subsection{Memory Pool}
+   The purpose of the memory pool is to claim a fixed amount of adjacent memory from the heap at the beginning of our operations.
+   This will be the memory used for the rest of the runtime. This offers two advantages, as described in \cite{DCWS}: claiming and freeing memory from this pool is cheaper for the
+   threads than doing the same with the heap and garbage collector, and the memory pool allows threads to reclaim memory still being referenced by thieves,
+   which is a better use of resources.
+   
+   
+   Given n threads and an element type T, the memory pool consists of 8*n blocks of memory in each of which can be stored a given number of elements of type T. The memory pool also has a "tracker" array of 8*n atomic size elements used to keep track of which lines are in use and which are free to be allocated.
+   
+   
+   To allocate the amount of memory m, a thread must take at least $l$ lines, where $(l*\texttt{size of line}) \geq m$. The thread must go through the tracker array reading the entries until it finds a free line (marked "0"). If it reads an entry $e > 0$, it must skip the (e-1) next lines as well, because they have been claimed by the same thread that marked the initial line. Once it finds an empty entry, the thread can atomically write $l$ to the entry to block it and the $l-1$ following lines in one operation (to prevent another thread from taking the same lines). The thread must then test to make sure the $l-1$ next lines are also free. If not, it must return the initial entry to 0 and keep searching. Else, it can give the reserved memory to the thread.
+   
+   To free the memory, the thread simply sets the tracker entry to "0". Note that this does not change the actual memory, so any "steal" operations in progress on the memory can finish.
+   \newline
+   \subsection{Circular Array}
+   
+   The circular array consists of an array of elements with type T (allocated from a given memory pool) as well as the array's current size. Elements are stored and accessed modulo this size, which is why it is called circular.
+   
+   This array can be grown by doubling its size. The array then gets a completely new  unfragmented memory block to store the entire array (plus extra space) from the memory pool and copies over the values, but also retains a pointer to the old memory block in case it wants to shrink back later. 
+   
+   The array can also be shrunk by halving its size, or if the structure already has a pointer to a smaller array from which it was grown, reverting to that smaller array (or even to an array being pointed to by that array, and so on). Additionally, since this smaller array will already have some elements stored, we only need to copy back those above a certain watermark (which we saved on growth). This way, we save allocation and copying time. The smallest memory field, which the array received at initialisation, cannot be shrunk or released during runtime and is kept by the the thread until termination.
+   
+   
+   \subsection{Work-stealing Deque}
+   Finally, our actual structure, the DCWSDeque is implemented using a Circular array of elements of type T wrapped in a \texttt{DequeNode}. This wrapper has boolean flags allowing the deque to be of type \texttt{Empty} or \texttt{Abort}.\newline
+   A deque is a double-ended queue, where only one end (\texttt{bottom}) can be accessed by its owner and all other threads can access this deque on the other end (\texttt{top}) to steal elements from it.
+   \texttt{bottom} and \texttt{top} are atomic long variables of the deque pointing respectively to the top and bottom indices where elements are stored in the circular array. Since the circular array always calculates indices modulo its size, our values can grow all the way to the maximum long value (possible but highly unlikely).
+   
+   In the usual implementation, each thread has one deque, and only the thread owning the deque can operate using its \texttt{bottom} value. This is where elements are pushed and popped by the owner, who can also grown or shrink the deque's array as needed. Since the owner is the only one using these operations, they need not be atomic (except in the event of the deque containing only one element, which we will see below). If a pop operation is attempted on an empty deque, the type \texttt{Empty} is returned.
+   
+   However, other threads can help the owner go through all the elements in its deque by stealing elements off the top. Since multiple threads might try to steal the same element, updating \texttt{top} to remove the stolen element must be done atomically. Whichever thread wins (by managing to complete the atomic Compare-and-swap) gets the element, the loser returning \texttt{Abort} instead.
+   
+   A special case occurs when only one element remains in the deque, so bottom is the same as top, and the thieves are suddenly competing with the owner of the deque as well. In this case, the owner's \texttt{popBottom} operation behaves like a thief, using the atomic Compare-and-Swap to try to remove the last element before a thief does.
+   
+   \section{Benchmarks}
+   \subsection{Benchmark 1: Array-based, Bounded Work-stealing Queue From Lecture}
+   This benchmark is identical to the DCWSDeque, except that it does not have access to the Circular Array and Memory Pool structures, and because of this the size of the deques are defined at compile time. Hence, while popping on an empty deque still returns an \texttt{Empty} element, we have modified the structure slightly so that when we try to push to a full deque, which is impossible, instead of failing, we spin until a pop occurs and a slot becomes free. (This way, we can measure output given fixed input more easily during the benchmarking, because no push should fail.)
+   
+   Note that we have also chosen to make this benchmark slightly different from the one in the lecture~(Lst.~\ref{lst:popB_lecture}) in order to handle the "ABA" problem the same way DCWSDeque does.
+   
+   \paragraph{The ABA Problem}
+   The ABA problem can occur in the very rare and specific case where a \texttt{popBottom} and a \texttt{steal} interleave in such a way that they both take the same value from the deque, only possible in the case where exactly one element is present in the array.
+   
+   \begin{center}
+      \begin{minipage}[c]{\textwidth} % no pagebreak within listing
+         \begin{lstlisting}[caption={\texttt{pop\_top/steal} from the lecture\cite{PP}}, label={lst:popB_lecture}]
+         T steal() {
+         int t = top;
+         if (bottom<=t) return null_value<T>;
+         T value = data[t];
+         if (compare_exchange(top,t,t+1) return value;
+         else return null_value<T>;
+         }
+         \end{lstlisting}
+      \end{minipage}
+   \end{center}
+   
+   \begin{center}
+      \begin{minipage}[c]{\textwidth} % no pagebreak within listing
+         \begin{lstlisting}[caption={\texttt{popBottom} from the lecture, which is vulnerable to the ABA problem\cite{PP}}, label={lst:popB_lecture}]
+         T pop_bottom() {
+         if (bottom==top) return null_value<T>;
+         
+         T value = data[--bottom];
+         int t = top;
+         if (bottom>t) return value;
+         if (bottom==t) {
+         if (compare_exchange(top,t,t) return value;
+         bottom++; // restore
+         } else bottom = t;
+         return null_value<T>;
+         }
+         \end{lstlisting}
+      \end{minipage}
+   \end{center}
+   
+   
+   Specifically, in Listing~\ref{lst:popB_lecture} we start with a deque containing only one element. The steal (process "A") must first read the values of bottom and top and check that \texttt{bottom} is bigger than \texttt{top}, which is true, since there is one element, so:
+   \begin{equation}
+   bottom == top + 1    
+   \end{equation}
+   
+   After this test, the \texttt{steal} operation copies the value in the array at the index of \texttt{top}, then must fall asleep before updating the top index atomically. The operation \texttt{popBottom} (process "B") must then start, decrementing bottom so that:
+   \begin{equation}
+   bottom == top   
+   \end{equation}
+   and copying the value in the array at the index of \texttt{bottom}, which is now the same as \texttt{top}. The two operations now want to return the same value. 
+   The \texttt{popBottom} operation continues, using the CAS operation to check that \texttt{top} has not changed, but without updating its value. Since \texttt{steal} is still asleep and has not changed \texttt{top}, \texttt{popBottom} succeeds and returns its value. The \texttt{steal} operation then wakes up, uses its own CAS to this time increment the \texttt{top} field, which wasn't modified by \texttt{popBottom} and returns the same value.
+   
+   In this way, the two operations exhibit an incorrect behaviour by returning the same value twice. This situation might be handled by a timestamp scheme using the last bits of the pointer to the \texttt{top} value (with moderate success, since these bits will eventually wrap around). Instead we have applied the solution tailored specifically for deques which is used in DCWSDeque, where in the case of a deque with only one element, \texttt{popBottom} must behave the same as \texttt{steal} by incrementing \texttt{top} (causing the \texttt{steal} operation's CAS to fail, so it cannot return the same value). In this way, we simply and elegantly solve this problem. % that would otherwise give this benchmark an incorrect advantage by allowing it to count certain nodes twice.
+   
+   
+   \subsection{Benchmark 2: Simple Lock-based Dynamic Queue}
+   This benchmark is a simple lock-based queue modelled as a linked list, where all the operations of "enqueue" and "dequeue" are wrapped in c++ \texttt{std::mutex} locks,
+   one for enqueue and one for dequeue to guarantee consistency.
+   
+   
+   \section{Theoretical analysis}
+   
+   \subsection{Lock Freedom}
+   
+   \paragraph{DCWSDeque}is lock-free, as in all of the three operations that might have thread conflicts, \texttt{steal}, \texttt{perhaps\_shrink} and \texttt{pop\_bottom}, a special \texttt{casTop}~(Lst.~\ref{lst:casTop}) operation based on C++'s compare-and-swap, is used to synchronise the atomic \texttt{top} index (bottom is only ever modified locally by one thread, the owner of the Deque). Listings~\ref{lst:popB_dcws},~\ref{lst:perhaps_shrink} show the locations where the \texttt{casTop} operation is used.
+   
+   \begin{center}
+      \begin{minipage}{.9\textwidth}
+         \begin{lstlisting} [caption={The \texttt{casTop} operation}, label={lst:casTop}]
+         /*atomically modify the index of the array where elements are 
+         *popped/stolen concurrently*/
+         
+         template <class T>
+         bool DCWSDeque<T>::casTop(long oldVal, long newVal) {
+         return this->top.compare_exchange_weak(oldVal, newVal);
+         }
+         \end{lstlisting}
+      \end{minipage}
+   \end{center}
+   
+   \begin{center}
+      \begin{minipage}{.9\textwidth}
+         \begin{lstlisting}[caption={\texttt{popBottom} resolves conflict on concurrent \texttt{steal} and  \texttt{popBottom} (same as in \texttt{steal})}, label={lst:popB_dcws}]
+         //for last element, check to prevent taking element if already stolen
+         if(!casTop(t, t+1)) {
+         poppedElem = this->Empty;
+         }
+         \end{lstlisting}
+      \end{minipage}
+   \end{center}
+   
+   \begin{center}
+      \begin{minipage}{.9\textwidth}
+         \begin{lstlisting}[caption={\texttt{perhapsShrink}}, label={lst:perhaps_shrink}]
+         //get back saved smaller array
+         auto aa = copyOfArrayToBeShrunk->shrink(bottom, top);
+         
+         //replace array with saved smaller array
+         this->activeArray = aa;
+         
+         //move bottom index to help see if steal occurred    
+         long ss = aa->arraySize();
+         this->bottom = (bottom + ss);
+         
+         /*atomically modify top: 
+         *if top different, a steal must have accessed it
+         *so we put back bottom so we don't erase the steal's effect*/
+         top = this->top;
+         if(! casTop(top, top + ss)) {
+         this->bottom = bottom;
+         }
+         \end{lstlisting}
+      \end{minipage}
+   \end{center}
+   
+   
+   \paragraph{BoundedDeque} is also lock-free, as it uses CAS operations on \texttt{top} with guaranteed global progress. Listing~\ref{lst:popB_bounded} shows the implemented \texttt{popBottom} operation with the same solution to tackle the ABA problem(present in Listing~\ref{lst:popB_lecture}) as DCWSDeque. Letting \texttt{popBottom} behave the same as steal, in the case the same object is referenced. Listing~\ref{lst:steal_bounded} shows the corresponding \texttt{steal} operation.
+   
+   \begin{center}
+      \begin{minipage}{.9\textwidth}
+         \begin{lstlisting}[caption={\texttt{popBottom} uses atomic update to handle concurrent steals of the last element}, label={lst:popB_bounded}]
+         template <class T>
+         Node<T> BoundedDeque<T>::popBottom() {
+         if(bottom == top){
+         return this->Empty;
+         }
+         --bottom;
+         auto val = array[bottom%max_size];
+         long t = top;
+         if(bottom < t){
+         this->bottom = t;
+         return  Empty;
+         }
+         if(bottom > t) {
+         return val;
+         }
+         if(bottom == t){
+         if(!top.compare_exchange_weak(t,t +1 )){
+         val =  this->Empty;
+         }
+         }
+         bottom++; //restore
+         return val;
+         
+         }
+         \end{lstlisting}
+      \end{minipage}
+   \end{center}
+   
+   
+   \begin{center}
+      \begin{minipage}[c]{.9\textwidth}
+         \begin{lstlisting}[caption={\texttt{steal} uses atomic swap to handle concurrent steals}, label={lst:steal_bounded}]
+         template <class T>
+         Node<T> BoundedDeque<T>::steal() {
+         long t = top;
+         if(bottom <= t){
+         return Empty;
+         }
+         Node<T> val = array[t%max_size];
+         
+         if(top.compare_exchange_weak(t, t+1)){
+         return  val;
+         } else{
+         return Empty;
+         }
+         }
+         \end{lstlisting}
+      \end{minipage}
+   \end{center}
+   
+   
+   \paragraph{Linked list} is not lock-free, as for its enqueue and dequeue it uses mutex locks on the whole operation~(Lst.~\ref{lst:deque_list}). This means that no two threads can ever dequeue an element at the same time. (Note that in this context, the lock on enqueue is pointless, and simply exists because it is part of the generic structure.)
+   
+   \begin{center}
+      \begin{minipage}{.9\textwidth}    
+         \begin{lstlisting}[caption={\texttt{deque} requires a lock before being run}, label={lst:deque_list}]
+         template <class T>
+         NodeLock<T> LockBasedQueue<T>::dequeue() {
+         NodeLock<T> elem;
+         
+         dequeue_mutex_lock.lock();
+         
+         if (head == tail) { //queue empty
+         elem = Empty;
+         } else {
+         NodeLock<T> *toRemove = head;
+         elem = *(head->getNext());
+         head = head->getNext();
+         delete toRemove;
+         }
+         dequeue_mutex_lock.unlock();
+         return elem;
+         }
+         \end{lstlisting}
+      \end{minipage}
+   \end{center}
+   
+   
+   
+   
+   \subsection{Wait Freedom}
+   \begin{itemize}
+      \item DCWSDeque is wait-free, as in all of the three operations \texttt{steal}, \texttt{push\_bottom} and \texttt{pop\_bottom}, we are guaranteed to finish in a finite number of steps. Specifically, in the case of a pop or steal, if the operation is not successful, we do not wait around, but simply return an \texttt{Empty} or \texttt{Abort} type.
+      
+      \item BoundedDeque, however, is not wait-free, because in the \texttt{push\_bottom} operation~(Lst.~\ref{lst:pushB_loop}), if there is not enough space for the new element, the method switches to busy waiting until some other element is popped from the deque and its place can be taken by the new element. Hence, in the case where no other thread ever takes an element from the full deque, this process will wait an infinite number of steps for an event that will never happen.
+      
+      \begin{center}
+         \begin{minipage}{.9\textwidth}
+            \begin{lstlisting}[caption={\texttt{pushBottom} keeps trying to add the item until it succeeds}, label={lst:pushB_loop}]
+            template <class T>
+            void BoundedDeque<T>::pushBottom(T item) {
+            bool added = false;
+            do {
+            added = try_push_bottom(item);
+            } while(!added);
+            }
+            \end{lstlisting}
+         \end{minipage}
+      \end{center}
+      
+      \item LockBasedQueue is not wait-free either, because every thread must wait to acquire a lock before proceeding with an operation. This may take an infinite number of steps, especially if a process is particularly slow in claiming the lock and keeps getting overtaken by other processes (fairness cannot be guaranteed for access to the lock here either).
+   \end{itemize}
+   
+   \subsection{Progress Guarantees}
+   \begin{itemize}
+      \item For DCWSDeque, progress is trivially guaranteed, since this structure has been proven wait-free.
+      \item For BoundedDeque, progress is guaranteed for any pop or steal operation, which simply returns \texttt{Empty} if there is nothing to take. The same cannot be said for the push operation, which might loop forever on a full deque waiting for a slot to become free.
+      \item The linked list has guaranteed progress, because for both locks, there will always be at least one thread that managed to gain access to the critical section and execute its operation. (This is especially true for the \texttt{enqueue} operation, which in this context is only ever used by the thread that owns it.)
+   \end{itemize}
+   
+   \subsection{Invariants}
+   \begin{itemize}
+      \item \bold{The atomic index \texttt{top} is never decremented.}
+      This helps us with concurrency among steals in the DCWSDeque and BoundedDeque. No thread can make \texttt{top} smaller, so any incrementation is irrevocable and the \texttt{steal} or \texttt{pop} operation that performed it cannot be erased by another thread.
+      \item \bold{Only the thread which owns the structure can add elements to it.}
+   \end{itemize}
+   
+   \subsection{Linearizability}
+   \begin{itemize}
+      \item DCWSDeque is linearizable in the following points:
+      \begin{itemize}
+         \item \texttt{pushBottom} linearizes at the increment of \texttt{bottom}, because this is where the new element becomes accessible by falling between \texttt{top} and \texttt{bottom}.
+         \item \texttt{popBottom} linearizes when \texttt{bottom} is originally decremented, because this is when the element to be popped is no longer accessible to the other threads, because it is no longer between \texttt{bottom} and \texttt{top}. The only exception is if there is only one element left to pop. In that case, the linearization point is at the \texttt{casTop} operation, to signal to any concurrent steals that this pop event has occurred.
+         \item \texttt{steal} linearizes on the \texttt{casTop}, because only if this operation happens successfully is the stolen element no longer accessible to the rest of the threads. If it fails, the operation has no effect.
+      \end{itemize}
+      \item BoundedDeque is linearizable, as said in the lecture~\cite{PP}, in the following points:
+      \begin{itemize}
+         \item \texttt{pushBottom} linearizes at the increment of \texttt{bottom} for the same reason as the DCWSDeque.
+         \item \texttt{popBottom} linearizes at the decrement of \texttt{bottom} (for the same reasons as the DCWSDeque), or the CAS operation if the deque becomes empty at some point during the operation because of a concurrent steal, also for the same reasons at in the DCWSDeque.
+         \item \texttt{pop\_top} linearizes at the CAS operation on top, for the same reasons as the DCWSDeque also.
+      \end{itemize}
+      \item LockBasedQueue is linearizable in the following points:
+      \begin{itemize}
+         \item \texttt{pushBottom} linearizes in the moment its tail is set as the new node, because then it can be reached by operations on the rest of the list.
+         \item \text{popBottom} linearizes in the moment its head pointer is set to point to the former head node's follower, because the former head's value becomes inaccessible (the node that held our popped value is now a sentinel and its value field is not accessed anymore).
+      \end{itemize}
+   \end{itemize}
+   
+   
+   \subsection{Worst Case Bounds}
+   
+   
+   \begin{table}[h]
+      \centering
+      \begin{tabular}{c||c}
+         \hline
+         DCWS & $\mathcal{O}($nb\_threads) \\ \hline
+         Bounded & $\mathcal{O}(1)$ \\ \hline
+         Lock & $\mathcal{O}($nb\_elem)\\ \hline 
+      \end{tabular}
+      \caption{Space assumption of the three different algorithms }
+      \label{tab:space}
+   \end{table}
+   
+   
+   \begin{table}[h]
+      \centering
+      \begin{tabular}{c||c|c|c}
+         \hline
+         & Push & Pop & Steal\\ \hline
+         DCWS & $\mathcal{O}(1)$ & $\mathcal{O}(1)$ & $\mathcal{O}(1)$  \\ \hline
+         Bound & $O(\infty)$ & $\mathcal{O}(1)$  & $\mathcal{O}(1)$ \\ \hline
+         Lock &  $O(1)$ & $\mathcal{O}(1)$ & $\mathcal{O}(1)$ \\ \hline
+      \end{tabular}
+      \caption{Time assumption of the three different algorithms}
+      \label{tab:wc}
+   \end{table}
+   
+   \subsection{Worst Case Scenarios}
+   
+   \begin{itemize}
+      \item The worst-case scenario for the DCWSDeque occurs when the memory pool runs out of space. At this point, any attempt to grow a circular array will fail. This could theoretically be prevented by allowing the memory pool itself to grow (assuming there is memory left to grow into), but this would defeat the entire purpose of having a memory pool in the first place, which is to save on time and complexity by storing all the deques in the same area. Assuming the memory pool is allocated big enough at the beginning, this should rarely, if ever, happen.
+      
+      \item The worst-case scenario for BoundedDeque is the very real and likely possibility that a deque will run out of space without any memory ever being freed, meaning any attempt to add new memory will enter an endless loop. This is why the DCWSDeque has been designed for its threads to be able to grow, to avoid this problem.
+      
+      \item For this structure, the worst case scenario for any thread is that a thread will get locked out of the critical section indefinitely because it keeps getting overtaken by other operations. This could be prevented by instituting a fairness factor such as a ticket system to give the lock to whichever process has been waiting for it the longest.
+      Antoher (absolutely worst-case) worst-case scenario for LockBasedQueue is the rarest of the three, namely that the heap, where nodes are allocated, will run out of space. This can only by prevented by an actual hardware upgrade.
+   \end{itemize}
+   
+   \section{Benchmarking}
+   
+   \subsection{Structure Of Source Code}
+   The code of the different data structures is structured into the folders Benchmark1, Benchmark2 and project~(Fig.~\ref{fig:dir_structure}), holding the Array-based Bounded Work-stealing Queue, Simple Lock-based Dynamic Queue and the DCWSDeque respectively. Each  contains a \texttt{CMakeLists.txt} file to build it as a separate project. For testing, gtest\footnote{GoogleTest, for unit tests.\url{https://github.com/google/googletest}} is used, containing the test-cases within the test folder.
+   
+   Benchmarking contains all code responsible for measuring the performance of the the three implementations.
+   In Benchmarking/src, all related \texttt{C++} code is present. \texttt{benchmarking\_main.cpp}  contains the main function, which in turn calls the corresponding \texttt{Benchmarking\_*} files. \texttt{Benchmarking\_*} is responsible to spawn the threads, represented by \texttt{ThreadBenchmarking\_*}. 
+   
+   
+   \begin{figure}[h]
+      % https://tex.stackexchange.com/questions/5073/making-a-simple-directory-tree#270761
+      \centering
+      \definecolor{foldercolor}{RGB}{124,166,198}
+      \tikzset{pics/folder/.style={code={%
+               \node[inner sep=0pt, minimum size=#1](-foldericon){};
+               \node[folder style, inner sep=0pt, minimum width=0.3*#1, minimum height=0.6*#1, above right, xshift=0.05*#1] at (-foldericon.west){};
+               \node[folder style, inner sep=0pt, minimum size=#1] at (-foldericon.center){};}
+         },
+         pics/folder/.default={20pt},
+         folder style/.style={draw=foldercolor!80!black,top color=foldercolor!40,bottom color=foldercolor}
+      }
+      
+      \forestset{is file/.style={edge path'/.expanded={%
+               ([xshift=\forestregister{folder indent}]!u.parent anchor) |- (.child anchor)},
+            inner sep=1pt},
+         this folder size/.style={edge path'/.expanded={%
+               ([xshift=\forestregister{folder indent}]!u.parent anchor) |- (.child anchor) pic[solid]{folder=#1}}, inner xsep=0.6*#1},
+         folder tree indent/.style={before computing xy={l=#1}},
+         folder icons/.style={folder, this folder size=#1, folder tree indent=3*#1},
+         folder icons/.default={12pt},
+      }
+      \resizebox{.35\linewidth}{!}{
+         \begin{forest}
+            for tree={font=\sffamily, grow'=0,
+               folder indent=.9em, folder icons,
+               edge=densely dotted}
+            [Project 10
+            [Benchmark1
+            [src]
+            [test]
+            [CMakeLists.txt, is file]
+            ]
+            [Benchmark2
+            [src]
+            [test]
+            [CMakeLists.txt, is file ]
+            ]
+            [Benchmarking
+            [cmake-build-debug]
+            [evaluation
+            [run\_benchmark.py, is file]
+            ]
+            [src]
+            [CMakeLists.txt, is file]
+            ]
+            [project
+            [src]
+            [test]
+            [CMakeLists.txt, is file]
+            ]
+            ]
+      \end{forest} }
+      \caption{Directory structure of project}
+      \label{fig:dir_structure}
+   \end{figure}
+   
+   
+   \subsection{Build And Run}
+   To compile the code, simply invoke \texttt{cmake} in a designated build directory and invoke \texttt{make}. Please note that the path where \texttt{benchmark\_run.py} expects the executable is within \textit{cmake-build-debug}.
+   
+   To run one instance of one benchmark simply start the newly built \texttt{benchmark} exectuable, containing a description of its program arguments. \texttt{benchmark\_run.py} contains python code to evaluate multiple runs of \texttt{benchmark} and plots the received data with 95\% confidence interval of 50 runs. The type of benchmark to be run can be changed within \texttt{benchmark\_run.py}.
+   
+   \subsection{Set-up}
+   The benchmark environment is the MARS system by the Parallel Computing research group TU Wien and a local machine with the key aspects presented in Table~\ref{tab:environment}. 
+   
+   \begin{table}[h]
+      \centering
+      \begin{tabular}{c||c|c}
+         \hline
+         & MARS & Local \\ \hline
+         Processor & 8 x Intel Xeon E7 8850 @ 2.00GHz & Intel Xeon E3 1240 @ 3.30GHz \\ \hline
+         Memory & 1008Gb & 16Gb\\ \hline
+         Operating System & Debian 4.14.17-1 x86\_64 GNU/Linux & 4.4.0-128-generic 154-Ubuntu x86\_64 \\ \hline
+         CMake & 3.10.2 & 3.5.1\\ \hline 
+         Gcc & 7.3.0  & 5.4.0 \\ \hline
+         Python & 3.6.5 & 3.5.2\\ \hline
+         C++ & \multicolumn{2}{c}{c++14 standard}    \\ \hline
+      \end{tabular}
+      \caption{Benchmarking environment}
+      \label{tab:environment}
+   \end{table}
+   
+   
+   For benchmarking, we measured the performance of the three data structures using three different algorithms. The elements given to handle to the structures are of type DAGNode~(DAGNode.h),
+   which have an id as well as a depth variable(both of type \texttt{long}), for reasons which will become clear in the second scenario~(Subsec.~\ref{subsec:dag}).
+   
+   Since the main goal of work stealing is better throughput rather than more fairness, all three scenarios measure throughput.
+   Each run ends when all deques of all threads are empty.
+   We use an array of booleans with one entry for each thread to track this.
+   Whenever a thread runs out of elements to pop, it marks itself empty before it begins to steal from threads still marked non-empty. The threads it steals from are chosen on the right and left of the thread, in the array, always moving further away as the closer threads become empty. (For example, thread 15 will first help thread 16, then thread 14, then thread 17 and so on.)
+   
+   Table~\ref{tab:benchmark} gives an overview of the number of elements pushed and the number of runs executed for different benchmarks. Each benchmark is run 50 times for a given number of threads.
+   
+   \begin{table}[h]
+      \centering
+      \begin{tabular}{c||c|c|c}
+         \hline
+         & Fixed Push & DAG & Steal \\ \hline
+         Number of elements & 20000 & Mean: $8*(1-\frac{d}{6})$ per depth $d$ & $20 000$ (only one queue)  \\ \hline
+         Number of runs & \multicolumn{3}{c}{50} \\ \hline
+         Number of threads & \multicolumn{3}{c}{Server: $\{p | p \in \mathbb{P} \land p \leq 150 \lor p = 1\}$ / Local: $\{p | 1 \leq p \leq 20 \}$} \\ \hline
+      \end{tabular}
+      \caption{Different Benchmark tactics}
+      \label{tab:benchmark}
+   \end{table}
+   
+   
+   \subsection{Fixed Push}
+   This benchmarking tactic consists of giving all threads a deque (from here on, we will also include the queue in LockBasedQueue when we say "deque", for efficiency's sake, although of course it remains a queue), having them push 20000 nodes to its structure and then popping them all again. If a thread finishes before the others, it starts to steal until all threads have finished.
+   
+   This benchmark works well to illustrate the speed at which clearly separated push and pop can work without steal helping too much, as ideally most of these threads will handle all their own elements before another thread manages to steal them. However, it is less realistic, since in practice these operations generally do not all occur separately.
+   
+   \subsection{DAG} \label{subsec:dag}
+   Here we attempt to create a more realistic simulation of real use of the data structures, where pushes and pops are mixed in together. We create a directed acyclic graph of node elements in the following manner:
+   Each thread starts with a structure containing only one element. Throughout runtime, the thread pops an element from its structure and then creates a number $n$ of children which it pushes back onto the deque. $n$~\eqref{eq:dag} is calculated according to a normal distribution involving the depth $d$ of the popped node, the maximum depth $D$ of the graph and the maximum branching factor $B$ of the graph (both $B= 8$ and $D=6$ are fixed values).
+   \begin{equation}\label{eq:dag}
+   n = \mathcal{N}(B * (1 - \frac{d}{D}), 1)    
+   \end{equation}
+   
+   Note that the children of the current node of depth $d$ are given depth $d+1$, so eventually the graph will reach a depth at which no more new children are generated. In this case, the structure simply pops another node, or, if finished, helps the other threads by stealing their nodes.
+   Since the number of children created varies slightly across threads, some will finish earlier than others and help by stealing sooner, which allows us to get an insight of interleaved push/popped and steal operations.
+   
+   \subsection{Steal}
+   In this third benchmark, we have one thread whose structure contains all the elements, while all the other threads must steal from it. This allows us to test how efficiently the steal operation works for each structure. Additionally every steal operates on a known possible non-empty Deque, whereas for tactic 1 and 2 the thread tries to steal from various neighbouring threads, looking for a non-empty one.
+   
+   
+   \section{Expectations}
+   We expect the Dynamic Circular Work-Stealing Queue to perform similarly to our benchmarks in the case of linear operations, where pushing to and popping from the data structure is performed separately.
+   
+   However, in the case where these are mixed and the steal operation are thrown in, we expect that DCWSDeque and our first benchmark, BoundedDeque, to have more throughput than the second benchmark LockBasedQueue, as LockBasedQueue locks a thread's entire structure for any dequeue operation. Thus steal and pop cannot happen simultaneously.
+   
+   For small numbers of elements, BoundedDeque is expected to be faster, because it does not have to spend time testing if it needs to grow or shrink like the DCWSDeque, or allocating memory for each element at runtime like LockBasedQueue.
+   
+   In the case where the needed space exceeds the actual size of BoundedDeque (which then enters a loop while waiting for room to become free again), we of course expect the DCWSDeque and linked list to perform much better, as they can grow to accommodate the input size, unlike their bounded counterpart. Note that this will not occur in the first benchmark, where we have given the BoundedDeque threads enough room for all the pushed nodes, because it would enter an endless loop otherwise.
+   
+   
+   \section{Results}
+   
+   \subsection{Fixed Push}
+   In this first scenario, of fixed pushes followed by pops and eventually steals~(Fig.~\ref{fig:push_fixed_mars}), LockBasedQueue performs with the worst throughput,
+   whereas DCWSDeque has an overall higher throughput, the best early one, and BoundedDeque has the highest throughput with more threads.
+   This is quite interesting, as concurrent push and pop/steal operations do not block each other, as long as there are nodes present in the data structure. 
+   This means the main theoretical drawback of LockBasedQueue is the allocation and de-allocation of its data elements by each push/pop/steal operation.
+   
+   For BoundedDeque, since its maximum size is set bigger than the maximum number of nodes present at any moment, it was again expected that it performs better than DCWSDeque, as DCWSDeque does have an overhead introduced by its dynamical resize functionality, especially for a higher number of threads, since finding enough unused memory in the pool might become more time-consuming.
+   
+   We also notice a a slight dip in all structures when we approach 80 threads, the number of cores the MARS server has.
+   Indeed for hyperthreading, two logical threads share the same execution unit and one physical core~\cite{hyperT}. Therefore this could be a potential cause of the overall nearly identical throughput from 80 to 160 threads.
+   
+   
+   
+   %This benchmark~(Fig.~\ref{fig:push_fixed_mars} gives us a rather interesting result for BoundedDeque. As expected, the LockBasedQueue and the DCWSDeque perform similarly well - since all the pushes occur at one time, as do the pops, and not very much stealing goes on, limiting inter-thread interference, the second benchmark is not handicapped by the way it handles concurrency (specifically the way it keeps two threads from operating on the same structure at the same time).
+   %For both DCWSDeque and LockBasedQueue locality more threads worse. 
+   %However, the first benchmark, while comparing positively to the two other structures up to around thirty threads, it then abruptly drops off to stabilise at a far lower throughput. This is surprising, since we expected this benchmark not to be hindered by its only difference to the DCWSDeque, namely the ability to grow. After all, the benchmarking algorithm only pushes 2000 elements to each thread, meaning the bounded array of the same size should have enough room to handle it without overflow.
+   
+   %One possible reason why the throughput declines at around 50 threads is, that the higher number of threads may lead to higher misses of the steal operation for the last remaining elements. 
+   
+   
+   In the local case~(Fig.~\ref{fig:push_fixed_local}) the speed-up is nearly linear as long as the actual number of spawned threads is smaller than the number of available cores. If the number of threads exceeds the number of cores, the throughput declines drastically to about the same throughput as for 1 thread.  For small numbers of threads, the different algorithms perform nearly as expected and seen also on MARS~(Fig.~\ref{fig:push_fixed_mars}).
+   Interestingly the throughput is the same for all three implementations if the number of threads is bigger than the logical available threads (8). 
+   %In the local case~(Fig.~\ref{fig:push_fixed_local}) the result also converges to a throughput of around 6000 nodes/ms. But the result for BoundedDeque differs quite drastically. 
+   
+   
+   \begin{figure}[h]
+      \centering
+      \includegraphics[width=.6\textwidth]{Monday/Monday_Push_Fixed_throughput.eps}
+      \caption{Fixed number of pushes, MARS}
+      \label{fig:push_fixed_mars}
+   \end{figure}
+   \clearpage
+   \begin{figure}[t]
+      \centering
+      \includegraphics[width=.6\textwidth]{local/Push_Fixed_throughput.eps}
+      \caption{Fixed number of pushed, Local}
+      \label{fig:push_fixed_local}
+   \end{figure}
+   
+   
+   
+   \subsection{DAG}
+   In Figure~\ref{fig:dag_mars}  BoundedDeque clearly has the highest throughput and scales better up to the number of physical cores. The reason why LockBasedQueue has relatively low throughput is probably that it needs to allocate and de-allocate memory for every push/pop operation from the OS and locks one end of the queue globally. But it is quite surprising that DCWSDeque has the lowest throughput in this scenario, since it has, compared to BoundedDeque, the sole overhead of resizing its queue in the case it already has a reference to a smaller array.
+   
+   For the first pop calls (if lots of steals have been going on), DCWSDeque resizes its circular array, as it suddenly discovers that all the steals have left a vast amount of free slots available. 
+   
+   \begin{figure}[h]
+      \centering
+      \includegraphics[width=.6\textwidth]{Monday/Monday_DAG_throughput.eps}
+      \caption{DAG scenario, MARS}
+      \label{fig:dag_mars}
+   \end{figure}
+   
+   For the local case~(Fig.~\ref{fig:dag_local}), the difference between BoundedDeque and the other two algorithms is not as big as on the MARS system. If the number of threads exceeds the number of logical threads, the throughput declines.
+   
+   
+   \begin{figure}[h]
+      \centering
+      \includegraphics[width=.6\textwidth]{local/DAG_throughput.eps}
+      \caption{DAG scenario, Local}
+      \label{fig:dag_local}
+   \end{figure}
+   
+   
+   \subsection{Steal}
+   Figures~\ref{fig:steal_mars} and~\ref{fig:steal_local} represent the benchmark run on MARS and local respecitvely, each with completely different outcome.
+   
+   On the server, the LockBasedQueue, interestingly enough, has the best throughput, followed by the DCWSDeque and then finally the BoundedDeque, perhaps because of the computational power wasted in the deques on operations that abort because of conflicts between threads when there are many interleaving calls (whereas the LockBasedQueue forces threads to wait for the lock instead). The very low throughput could originate from the way the spawned threads are located on the physical cores or even processors. As shown in Table~\ref{tab:environment}, MARS contains eight processors.
+   
+   Locally, the BoundedDeque manages with clearly the highest throughput, whereas all three share the same throughput characteristic. They all have a general higher throughput for even numbers of threads, compared to odd numbers of threads. One explanation for this phenomena could be that for the odd case, thread 0, which has the sole non-empty Deque, resides on a different physical process than the active stealing threads, where L3 cache is not shared between them. Whereas for even number of threads, at least one stealing thread shares its cache with thread 0. 
+   
+   Since this strange output interested us, we ran a quick local benchmark where instead of the owner being thread 0, it was the thread at the middle, (thread "thread number/2")~(Fig.~\ref{fig:steal_local_centered}).
+   This result has a similar behaviour to what the server gave us. Despite the fact that the server uses always thread 0 to steal from.
+   
+   
+   \begin{figure}
+      \centering
+      \includegraphics[width=.6\textwidth]{Monday/Monday_Steal_throughput.eps}
+      \caption{Steal, only one thread has a queue, on MARS}
+      \label{fig:steal_mars}
+   \end{figure}
+   
+   
+   \begin{figure}
+      \centering
+      \includegraphics[width=.6\textwidth]{local/Steal_throughput.eps}
+      \caption{Steal scenario on Local machine}
+      \label{fig:steal_local}
+   \end{figure}
+   
+   
+   \begin{figure}
+      \centering
+      \includegraphics[width=.6\textwidth]{local/Steal_throughput_centered.eps}
+      \caption{Steal scenario on Local machine with centered owner}
+      \label{fig:steal_local_centered}
+   \end{figure}
+   
+   \pagebreak
+   \section{Conclusion}
+   
+   Altogether, we were rather disappointed by DCWSDeque's results in the benchmarking. It displayed no particular efficiency and was often the worst solution.
+   
+   On the other hand, these benchmarks left out one of the reasons this structure is used, which is that its memory pool allows it to resize itself according to needs with a slight overhead, as we have seen. This prevents it from having to save excessive amounts of memory at initialisation, like BoundedDeque, or possibly overwhelm the heap, like LockBasedQueue. In this way, the DCWSDeqeue would be able to run alongside other programs and for longer periods of time, possibly years, even if in the short run it might perform worse.
+   
+   There is also the fact that we have chosen the size of the BoundedDeque in such a way that it has usually enough space. And apparently, stealing was so effective that waiting for more space to be made so a push could complete was not a problem.
+   
+   %However, testing this with the given benchmarking structures would have been difficult.
+   For further work, the DcwsDeque could use not a manual memory pool as presented in this work, but rather use an existing memory allocator like jemalloc\footnote{\url{https://github.com/jemalloc/jemalloc}} for better memory management.
+   
+   
+   
+   
+   
+   
+   
+   
+   %##############################################################################################################################################################
+   
+   
+   
+   %\section{Sources}
+   %\begin{itemize}
+   %    \item Chase, David, and Yossi Lev. "Dynamic circular work-stealing deque." Proceedings of the seventeenth annual ACM symposium on Parallelism in algorithms and architectures. ACM, %2005.
+   %
+   %\end{itemize}
+   
+   
+   
+   \clearpage
+   \bibliography{bibfile}
+   \bibliographystyle{IEEEtran}
+   
+\end{document}

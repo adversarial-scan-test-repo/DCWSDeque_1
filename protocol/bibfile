@@ -1,0 +1,9 @@
+@inproceedings{chase2005dynamic,
+  title={Dynamic circular work-stealing deque},
+  author={Chase, David and Lev, Yossi},
+  booktitle={Proceedings of the seventeenth annual ACM symposium on Parallelism in algorithms and architectures},
+  pages={21--28},
+  year={2005},
+  organization={ACM}
+}
+
